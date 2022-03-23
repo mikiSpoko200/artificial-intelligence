@@ -1,7 +1,8 @@
 mod tests;
 
-use std::fmt::{Debug, Formatter};
-use std::hash::{Hash, Hasher};
+use std::collections::{ HashSet, VecDeque };
+use std::fmt::{Debug, Display, Formatter};
+use std::fs;
 use std::ops::RangeInclusive;
 
 const KING_MOVES: [(Pos, Pos); 8] = [
@@ -29,6 +30,16 @@ impl Color {
     }
 }
 
+impl Display for Color {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let color = match self {
+            Color::Black => "black",
+            Color::White => "white",
+        };
+        write!(f, "{}", color)
+    }
+}
+
 impl From<&str> for Color {
     fn from(color: &str) -> Self {
         match color {
@@ -39,9 +50,10 @@ impl From<&str> for Color {
     }
 }
 
+#[derive(Debug)]
 enum TraversalResult {
     Inf,
-    CheckMate(State)
+    CheckMate(Vec<State>)
 }
 
 type Pos = i8;
@@ -52,7 +64,7 @@ type Pos = i8;
 /// similarly encoded tile column number.
 /// Fields are numbered from 0-7 increasing just as in typical chess board that is:
 /// from left bottom corner upwards and rightwards.
-#[derive(Hash, Eq, PartialEq)]
+#[derive(Hash, Eq, PartialEq, Clone)]
 struct State {
     black_king_pos: Pos,
     white_king_pos: Pos,
@@ -64,6 +76,18 @@ impl State {
     const POSITION_ENCODING_OFFSET: u8 = 3;
     const ROW_BITMASK: Pos = (1 << State::POSITION_ENCODING_OFFSET) - 1;
     const COL_BITMASK: Pos = State::ROW_BITMASK << State::POSITION_ENCODING_OFFSET;
+
+    fn position_to_string(position: Pos) -> String {
+        let (col, row) = State::decode_position(position);
+        String::from_utf8(vec![col as u8 + b'a', row as u8 + b'1']).unwrap()
+    }
+
+    pub fn from_file(path: &str) -> Self {
+        let state = String::from(
+            fs::read_to_string(path).expect(format!("Cannot read data from: {}", path).as_str())
+        );
+        State::from(state.as_str())
+    }
 
     pub const fn new(white_king_pos: Pos, white_rook_pos: Pos, black_king_pos: Pos, turn: Color) -> Self {
         Self {black_king_pos, white_king_pos, white_rook_pos, turn}
@@ -82,6 +106,16 @@ impl State {
     /// Checks if given pawn position is within board bounds.
     fn is_position_within_bounds(&self, col: Pos, row: Pos) -> bool {
         BOARD_BOUNDS.contains(&col) && BOARD_BOUNDS.contains(&row)
+    }
+
+    /// Checks if current current state is a checkmate.
+    pub fn is_checkmate(&self, possible_moves: usize) -> bool {
+        let (black_king_col, black_king_row) = State::decode_position(self.black_king_pos);
+        let (white_king_col, white_king_row) = State::decode_position(self.white_king_pos);
+        let (rook_col, rook_row) = State::decode_position(self.white_rook_pos);
+        let king_check = (black_king_col - white_king_col).abs() < 2 && (black_king_row - white_king_row).abs() < 2;
+        let rook_check = black_king_col == rook_col || black_king_row == rook_row;
+        (king_check || rook_check) && possible_moves == 0
     }
 
     fn rook_moves(&self) -> impl Iterator<Item=State> + '_ {
@@ -119,7 +153,7 @@ impl State {
             }
         }
         let horizontal_rook_moves = (left_range..=right_range).filter_map(move |col|{
-            if col == rook_col {
+            if col == rook_col || (col - black_king_col).abs() < 2 && (rook_row - black_king_row).abs() < 2 {
                 None
             } else {
                 Some(State::new(
@@ -131,22 +165,22 @@ impl State {
             }
         });
         let vertical_rook_moves = (bottom_range..=top_range).filter_map(move |row|{
-                    if row == rook_row {
-                        None
-                    } else {
-                        Some(State::new(
-                            self.white_king_pos,
-                            State::encode_position(rook_col, row),
-                            self.black_king_pos,
-                            self.turn.flip()
-                        ))
-                    }
-                });
+            if row == rook_row || (rook_col - black_king_col).abs() < 2 && (row - black_king_row).abs() < 2 {
+                None
+            } else {
+                Some(State::new(
+                    self.white_king_pos,
+                    State::encode_position(rook_col, row),
+                    self.black_king_pos,
+                    self.turn.flip()
+                ))
+            }
+        });
         horizontal_rook_moves.chain(vertical_rook_moves)
     }
 
     /// Produces all valid substates of the current state.
-    pub fn substates(&self) -> Box<dyn Iterator<Item=State> + '_> {
+    pub fn substates(&self) -> Vec<State> {
         // Common fail conditions:
         // - Any pawn tries to move into a tile that is already occupied.
         // Rook:
@@ -160,7 +194,6 @@ impl State {
 
         match self.turn {
             Color::Black => {
-                // URGENT: ADD CHECKMATE AND DRAW CHECKS HERE
                 let (col, row) = State::decode_position(self.black_king_pos);
                 let substates = KING_MOVES.into_iter().filter_map(move |(mut new_col, mut new_row)| {
                     // move pawn to new position
@@ -191,7 +224,7 @@ impl State {
                         ))
                     }
                 });
-                Box::new(substates)
+                substates.collect()
             }
             Color::White => {
                 let (rook_col, rook_row) = State::decode_position(self.white_rook_pos);
@@ -221,9 +254,30 @@ impl State {
                 });
                 let rook_moves = self.rook_moves();
                 let substates = king_moves.chain(rook_moves);
-                Box::new(substates)
+                substates.collect()
             }
         }
+    }
+
+    pub fn solve(self) -> TraversalResult {
+        let mut memo = HashSet::<State>::with_capacity(64 * 63 * 62 * 2);
+        let path = Vec::new();
+        let mut lifo = VecDeque::<(State, Vec<State>)>::from([(self, path)]);
+        while let Some((state, mut path)) = lifo.pop_front() {
+            path.push(state.clone());
+            let substates = state.substates();
+            if state.is_checkmate(substates.len()) {
+                return TraversalResult::CheckMate(path);
+            } else {
+                for substate in state.substates() {
+                    if !memo.contains(&substate) {
+                        memo.insert(substate.clone());
+                        lifo.push_back((substate, path.clone()));
+                    }
+                }
+            }
+        }
+        TraversalResult::Inf
     }
 }
 
@@ -238,6 +292,15 @@ impl Debug for State {
             .field("black king position", &black_king_position)
             .field("turn", &self.turn)
             .finish()
+    }
+}
+
+impl Display for State {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let wk_pos = State::position_to_string(self.white_king_pos);
+        let r_pos = State::position_to_string(self.white_rook_pos);
+        let bk_pos = State::position_to_string(self.black_king_pos);
+        write!(f, "{} {} {} {}", self.turn, wk_pos, r_pos, bk_pos)
     }
 }
 
@@ -274,8 +337,10 @@ impl From<&str> for State {
 }
 
 fn main() {
-    let state = State::from("white c4 g4 e4");
-    for substate in state.substates() {
-        println!("{:?}", substate);
-    }
+    let state = State::from_file("zad1_input.txt");
+    let outcome = match state.solve() {
+        TraversalResult::Inf => { String::from("INF") }
+        TraversalResult::CheckMate(path) => { (path.len() - 1).to_string() }
+    };
+    fs::write("zad1_output.txt", outcome.as_bytes()).expect(format!("Could not write {} to zad1_output.txt", outcome).as_str());
 }
